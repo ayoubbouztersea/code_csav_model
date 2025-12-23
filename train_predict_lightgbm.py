@@ -213,27 +213,35 @@ class LightGBMMultiLabelClassifier:
         """
         logger.info("Building LightGBM multi-output model...")
         
-        # LightGBM base classifier tuned for MacBook Air M2 (memory-aware)
+        # Accuracy-focused LightGBM base classifier.
+        # Target runtime: c2d-standard-32 (32 vCPU / 128 GB RAM).
+        #
+        # Note on parallelism:
+        # - We parallelize across labels via MultiOutputClassifier(n_jobs=32)
+        # - Each LightGBM fit uses a single thread (n_jobs=1) to avoid oversubscription
         lgb_classifier = lgb.LGBMClassifier(
-            n_estimators=110,          # further reduced trees to avoid OOM
-            max_depth=7,               # shallower trees for speed
-            learning_rate=0.08,
-            num_leaves=48,
-            min_child_samples=30,
-            subsample=0.8,
+            boosting_type="gbdt",
+            objective="binary",
+            n_estimators=2000,          # more boosting rounds for better accuracy
+            learning_rate=0.03,         # smaller LR + more trees typically generalizes better
+            num_leaves=256,             # higher capacity (paired with regularization below)
+            max_depth=-1,               # let leaves drive complexity; tune if overfitting
+            min_child_samples=10,
+            subsample=0.9,
             subsample_freq=1,
-            colsample_bytree=0.7,
-            reg_alpha=0.2,
-            reg_lambda=0.2,
-            force_col_wise=True,       # better memory footprint on wide data
-            device_type="cpu",         # explicit for Apple Silicon
+            colsample_bytree=0.9,
+            reg_alpha=0.0,
+            reg_lambda=0.1,
+            is_unbalance=True,          # helps for highly imbalanced one-vs-rest labels
+            force_col_wise=True,        # generally safer on wide/tabular data
+            device_type="cpu",
             random_state=self.random_state,
-            n_jobs=4,                 # limit threads on M2 to reduce RAM spikes
+            n_jobs=1,
             verbose=-1
         )
         
-        # Wrap in MultiOutputClassifier for multi-label prediction
-        self.model = MultiOutputClassifier(lgb_classifier, n_jobs=-1)
+        # Wrap in MultiOutputClassifier for multi-label prediction (parallel across outputs)
+        self.model = MultiOutputClassifier(lgb_classifier, n_jobs=32)
         
         logger.info("Model built successfully")
         return self.model
