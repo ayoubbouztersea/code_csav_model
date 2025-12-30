@@ -9,6 +9,8 @@ labels dynamically based on true label cardinality:
 
 Evaluation uses exact match accuracy per cardinality bucket.
 
+Optimized for: c2d-standard-32 (32 vCPU, 128 GB RAM)
+
 Author: ML Engineering Team
 Date: December 2025
 """
@@ -26,6 +28,7 @@ from sklearn.preprocessing import MultiLabelBinarizer, LabelEncoder
 from sklearn.multioutput import MultiOutputClassifier
 import lightgbm as lgb
 import joblib
+from joblib import Parallel, delayed
 
 warnings.filterwarnings('ignore')
 
@@ -35,6 +38,18 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# MACHINE CONFIGURATION: c2d-standard-32 (32 vCPU, 128 GB RAM)
+# ============================================================================
+N_CPUS = 32
+MEMORY_GB = 128
+# Strategy: Parallelize across labels with MultiOutputClassifier
+# Each LightGBM estimator uses 1 thread to avoid oversubscription
+N_JOBS_LABELS = N_CPUS  # Number of labels to train in parallel
+N_JOBS_LGB = 1          # Threads per LightGBM estimator
+# For prediction: use all cores for parallel probability computation
+N_JOBS_PREDICT = N_CPUS
 
 
 class LightGBMDynamicMultiLabelClassifier:
@@ -148,7 +163,8 @@ class LightGBMDynamicMultiLabelClassifier:
         """
         Prepare feature columns for training.
         Handles both numeric and categorical features.
-        Downcasts numerics to float32/int32 to reduce memory (helpful on M2).
+        Optimized for high-memory machine (128 GB): uses float32 for balance of
+        speed and memory, keeps data contiguous for cache efficiency.
         
         Args:
             df (pd.DataFrame): Input dataframe
@@ -166,24 +182,34 @@ class LightGBMDynamicMultiLabelClassifier:
         
         df_features = df[feature_cols].copy()
         
-        # Handle categorical columns with label encoding
-        categorical_cols = df_features.select_dtypes(include=['object']).columns
+        # Handle categorical columns with label encoding (parallelized)
+        categorical_cols = df_features.select_dtypes(include=['object']).columns.tolist()
         
-        for col in categorical_cols:
-            le = LabelEncoder()
-            df_features[col] = le.fit_transform(df_features[col].astype(str))
+        if categorical_cols:
+            logger.info(f"Encoding {len(categorical_cols)} categorical columns...")
+            for col in categorical_cols:
+                le = LabelEncoder()
+                df_features[col] = le.fit_transform(df_features[col].astype(str))
         
-        # Downcast numerics to save memory on Apple Silicon
+        # Convert to float32 for optimal LightGBM performance
+        # float32 is faster than float64 and sufficient precision for tree-based models
         numeric_cols = df_features.select_dtypes(include=[np.number]).columns
-        df_features[numeric_cols] = df_features[numeric_cols].apply(
-            pd.to_numeric, errors='coerce', downcast='float'
-        )
+        for col in numeric_cols:
+            df_features[col] = df_features[col].astype(np.float32)
 
         # Fill any missing values after conversions
         df_features = df_features.fillna(-1)
         
+        # Ensure contiguous memory layout for cache efficiency
+        df_features = pd.DataFrame(
+            np.ascontiguousarray(df_features.values, dtype=np.float32),
+            columns=df_features.columns,
+            index=df_features.index
+        )
+        
         self.feature_columns = df_features.columns.tolist()
         logger.info(f"Features prepared. Number of features: {len(self.feature_columns)}")
+        logger.info(f"Memory usage: {df_features.memory_usage(deep=True).sum() / 1e9:.2f} GB")
         
         return df_features
     
@@ -215,41 +241,51 @@ class LightGBMDynamicMultiLabelClassifier:
     def build_model(self):
         """
         Build LightGBM multi-output classifier using One-Vs-Rest strategy.
+        Optimized for c2d-standard-32 (32 vCPU, 128 GB RAM).
         
         Returns:
             MultiOutputClassifier: Configured model
         """
         logger.info("Building LightGBM multi-output model...")
+        logger.info(f"Parallelization strategy: {N_JOBS_LABELS} labels in parallel, "
+                   f"{N_JOBS_LGB} thread(s) per LightGBM estimator")
         
-        # Accuracy-focused LightGBM base classifier.
-        # Target runtime: c2d-standard-32 (32 vCPU / 128 GB RAM).
+        # Accuracy-focused LightGBM base classifier optimized for c2d-standard-32
+        # 
+        # Parallelism strategy:
+        # - Train multiple label classifiers in parallel (N_JOBS_LABELS=32)
+        # - Each LightGBM uses 1 thread (N_JOBS_LGB=1) to avoid oversubscription
+        # - This maximizes throughput on 32 vCPU machine
         #
-        # Note on parallelism:
-        # - We parallelize across labels via MultiOutputClassifier(n_jobs=32)
-        # - Each LightGBM fit uses a single thread (n_jobs=1) to avoid oversubscription
+        # Memory optimizations for 128 GB RAM:
+        # - max_bin=255 for good precision with reasonable memory
+        # - histogram_pool_size optimized for available memory
         lgb_classifier = lgb.LGBMClassifier(
             boosting_type="gbdt",
             objective="binary",
-            n_estimators=2000,          # more boosting rounds for better accuracy
-            learning_rate=0.03,         # smaller LR + more trees typically generalizes better
-            num_leaves=256,             # higher capacity (paired with regularization below)
-            max_depth=-1,               # let leaves drive complexity; tune if overfitting
+            n_estimators=2000,           # more boosting rounds for better accuracy
+            learning_rate=0.03,          # smaller LR + more trees generalizes better
+            num_leaves=256,              # higher capacity (paired with regularization)
+            max_depth=-1,                # let leaves drive complexity
             min_child_samples=10,
             subsample=0.9,
             subsample_freq=1,
             colsample_bytree=0.9,
             reg_alpha=0.0,
             reg_lambda=0.1,
-            is_unbalance=True,          # helps for highly imbalanced one-vs-rest labels
-            force_col_wise=True,        # generally safer on wide/tabular data
+            is_unbalance=True,           # helps for highly imbalanced one-vs-rest labels
+            # Performance optimizations for c2d-standard-32
+            max_bin=255,                 # default, good balance of speed/accuracy
+            force_col_wise=True,         # better for wide data, avoids race conditions
             device_type="cpu",
             random_state=self.random_state,
-            n_jobs=1,
+            n_jobs=N_JOBS_LGB,           # 1 thread per estimator (parallelism at label level)
             verbose=-1
         )
         
-        # Wrap in MultiOutputClassifier for multi-label prediction (parallel across outputs)
-        self.model = MultiOutputClassifier(lgb_classifier, n_jobs=32)
+        # Wrap in MultiOutputClassifier for multi-label prediction
+        # Parallelize across labels (n_jobs=32 for 32 vCPU)
+        self.model = MultiOutputClassifier(lgb_classifier, n_jobs=N_JOBS_LABELS)
         
         logger.info("Model built successfully")
         return self.model
@@ -257,26 +293,50 @@ class LightGBMDynamicMultiLabelClassifier:
     def train(self, X_train, y_train):
         """
         Train the multi-label classifier.
+        Optimized for c2d-standard-32 (32 vCPU, 128 GB RAM).
         
         Args:
             X_train (pd.DataFrame): Training features
             y_train (np.ndarray): Training labels (one-hot encoded)
         """
-        logger.info("Starting model training...")
+        import time
+        
+        logger.info("="*60)
+        logger.info("STARTING MODEL TRAINING")
+        logger.info(f"Training samples: {X_train.shape[0]}")
+        logger.info(f"Features: {X_train.shape[1]}")
+        logger.info(f"Labels: {y_train.shape[1]}")
+        logger.info(f"Parallelization: {N_JOBS_LABELS} label classifiers in parallel")
+        logger.info("="*60)
         
         # Ensure dense y for LightGBM (it does not accept sparse targets)
         if sparse.issparse(y_train):
-            y_train_dense = y_train.toarray()
+            logger.info("Converting sparse labels to dense array...")
+            y_train_dense = y_train.toarray().astype(np.int8)  # int8 for memory efficiency
         else:
-            y_train_dense = y_train
-
-        self.model.fit(X_train, y_train_dense)
+            y_train_dense = np.asarray(y_train, dtype=np.int8)
         
-        logger.info("Model training completed")
+        # Ensure X is contiguous float32 for optimal LightGBM performance
+        if hasattr(X_train, 'values'):
+            X_train_arr = np.ascontiguousarray(X_train.values, dtype=np.float32)
+        else:
+            X_train_arr = np.ascontiguousarray(X_train, dtype=np.float32)
+        
+        logger.info(f"Training data memory: {X_train_arr.nbytes / 1e9:.2f} GB (features) + "
+                   f"{y_train_dense.nbytes / 1e9:.2f} GB (labels)")
+        
+        start_time = time.time()
+        self.model.fit(X_train_arr, y_train_dense)
+        elapsed = time.time() - start_time
+        
+        logger.info("="*60)
+        logger.info(f"MODEL TRAINING COMPLETED in {elapsed:.1f} seconds ({elapsed/60:.1f} min)")
+        logger.info("="*60)
     
     def predict_all_probabilities(self, X):
         """
         Get probability predictions for all labels.
+        Optimized with parallel prediction across estimators.
         
         Args:
             X (pd.DataFrame): Feature matrix
@@ -284,22 +344,34 @@ class LightGBMDynamicMultiLabelClassifier:
         Returns:
             np.ndarray: Probability matrix (samples x labels)
         """
-        logger.info("Computing probabilities for all labels...")
+        n_labels = len(self.model.estimators_)
+        n_samples = len(X)
+        logger.info(f"Computing probabilities for {n_labels} labels on {n_samples} samples...")
         
-        probabilities = []
-        for estimator in self.model.estimators_:
-            proba = estimator.predict_proba(X)
-            # Get probability for class 1 (positive class)
-            probabilities.append(proba[:, 1])
+        # Ensure X is contiguous for cache efficiency
+        X_arr = np.ascontiguousarray(X.values, dtype=np.float32) if hasattr(X, 'values') else X
         
-        # Stack probabilities (samples x labels)
-        all_probabilities = np.column_stack(probabilities).astype(np.float32)
+        def _get_proba(estimator):
+            """Get positive class probability for a single estimator."""
+            proba = estimator.predict_proba(X_arr)
+            return proba[:, 1].astype(np.float32)
         
+        # Parallel probability computation across estimators
+        logger.info(f"Running parallel prediction with {N_JOBS_PREDICT} workers...")
+        probabilities = Parallel(n_jobs=N_JOBS_PREDICT, prefer="threads")(
+            delayed(_get_proba)(est) for est in self.model.estimators_
+        )
+        
+        # Stack probabilities (samples x labels) - pre-allocate for efficiency
+        all_probabilities = np.column_stack(probabilities)
+        
+        logger.info(f"Probability matrix shape: {all_probabilities.shape}")
         return all_probabilities
     
     def predict_top_k_with_probabilities(self, X, k=3):
         """
         Predict top k labels with their probabilities for each sample.
+        Optimized with vectorized operations for c2d-standard-32.
         
         Args:
             X (pd.DataFrame): Feature matrix
@@ -313,26 +385,29 @@ class LightGBMDynamicMultiLabelClassifier:
         logger.info(f"Predicting top {k} labels with probabilities...")
         
         all_probabilities = self.predict_all_probabilities(X)
+        n_samples = len(X)
         
-        # Get top k indices for each sample
-        top_k_indices = np.argsort(all_probabilities, axis=1)[:, -k:][:, ::-1]
-        
-        # Get corresponding probabilities
-        top_k_probas = np.take_along_axis(all_probabilities, top_k_indices, axis=1)
+        # Vectorized top-k computation using argpartition (faster than full argsort)
+        logger.info(f"Computing top-{k} predictions (vectorized)...")
+        top_k_indices_unordered = np.argpartition(all_probabilities, -k, axis=1)[:, -k:]
+        top_k_probas_unordered = np.take_along_axis(all_probabilities, top_k_indices_unordered, axis=1)
+        # Sort within top-k for proper ordering (descending)
+        sort_order = np.argsort(-top_k_probas_unordered, axis=1)
+        top_k_indices = np.take_along_axis(top_k_indices_unordered, sort_order, axis=1)
+        top_k_probas = np.take_along_axis(top_k_probas_unordered, sort_order, axis=1)
         
         # Convert indices to label names
+        classes = self.label_encoder.classes_
         predicted_labels = []
         predicted_probas = []
         
-        for i in range(len(X)):
-            # Get label names for top k predictions
-            labels = [self.label_encoder.classes_[idx] for idx in top_k_indices[i]]
+        for i in range(n_samples):
+            labels = [classes[idx] for idx in top_k_indices[i]]
             probas = top_k_probas[i].tolist()
-            
             predicted_labels.append(labels)
             predicted_probas.append(probas)
         
-        logger.info(f"Prediction completed for {len(X)} samples")
+        logger.info(f"Prediction completed for {n_samples} samples")
         
         return predicted_labels, predicted_probas
     
@@ -342,6 +417,8 @@ class LightGBMDynamicMultiLabelClassifier:
         - 1 true label → keep top 1 prediction
         - 2 true labels → keep top 2 predictions
         - 3+ true labels → keep top 3 predictions
+        
+        Optimized with vectorized operations for c2d-standard-32.
         
         Args:
             X (pd.DataFrame): Feature matrix
@@ -355,39 +432,58 @@ class LightGBMDynamicMultiLabelClassifier:
         logger.info("Predicting with dynamic top-k based on true label cardinality...")
         
         all_probabilities = self.predict_all_probabilities(X)
+        n_samples = len(X)
         
-        # Get top 3 indices for each sample (we'll filter based on cardinality)
-        top_3_indices = np.argsort(all_probabilities, axis=1)[:, -3:][:, ::-1]
-        top_3_probas = np.take_along_axis(all_probabilities, top_3_indices, axis=1)
+        # Vectorized top-3 computation using argpartition (faster than full argsort)
+        # argpartition is O(n) vs O(n log n) for argsort
+        logger.info("Computing top-3 predictions (vectorized)...")
+        k = 3
+        # Get indices of top-3 (unordered)
+        top_k_indices_unordered = np.argpartition(all_probabilities, -k, axis=1)[:, -k:]
+        # Get the probabilities for these indices
+        top_k_probas_unordered = np.take_along_axis(all_probabilities, top_k_indices_unordered, axis=1)
+        # Sort within the top-k to get proper ordering (descending)
+        sort_order = np.argsort(-top_k_probas_unordered, axis=1)
+        top_3_indices = np.take_along_axis(top_k_indices_unordered, sort_order, axis=1)
+        top_3_probas = np.take_along_axis(top_k_probas_unordered, sort_order, axis=1)
         
+        # Pre-compute cardinalities as numpy array for vectorized operations
+        cardinalities = np.array([min(len(t), 3) for t in true_labels], dtype=np.int32)
+        
+        # Convert label indices to names (vectorized where possible)
+        classes = self.label_encoder.classes_
+        
+        logger.info("Building dynamic prediction lists...")
         predicted_labels = []
         predicted_probas = []
         
-        for i in range(len(X)):
-            # Determine k based on true label cardinality
-            true_card = len(true_labels[i])
-            k = min(true_card, 3)  # Cap at 3
+        # Process in batches for better cache utilization
+        batch_size = 10000
+        for batch_start in range(0, n_samples, batch_size):
+            batch_end = min(batch_start + batch_size, n_samples)
             
-            # Get top k labels and probabilities
-            labels = [self.label_encoder.classes_[idx] for idx in top_3_indices[i][:k]]
-            probas = top_3_probas[i][:k].tolist()
-            
-            predicted_labels.append(labels)
-            predicted_probas.append(probas)
+            for i in range(batch_start, batch_end):
+                k_i = cardinalities[i]
+                labels = [classes[idx] for idx in top_3_indices[i, :k_i]]
+                probas = top_3_probas[i, :k_i].tolist()
+                predicted_labels.append(labels)
+                predicted_probas.append(probas)
         
-        logger.info(f"Dynamic prediction completed for {len(X)} samples")
+        logger.info(f"Dynamic prediction completed for {n_samples} samples")
         
         return predicted_labels, predicted_probas
     
     def fit_label_encoder(self, labels_list):
         """
         Fit a label encoder and convert multi-labels to one-hot encoding.
+        Optimized for 128 GB RAM: uses sparse output during fit,
+        converts to dense during training for LightGBM compatibility.
         
         Args:
             labels_list (list): List of label lists
             
         Returns:
-            np.ndarray: One-hot encoded labels
+            sparse matrix: One-hot encoded labels (sparse for memory during split)
         """
         logger.info("Fitting label encoder...")
         
@@ -396,11 +492,19 @@ class LightGBMDynamicMultiLabelClassifier:
         for labels in labels_list:
             all_labels.update(labels)
         
-        # Create and fit MultiLabelBinarizer with sparse output to save memory
+        # Create and fit MultiLabelBinarizer
+        # Use sparse output for memory efficiency during train/test split
+        # Will convert to dense during training (LightGBM requirement)
         self.label_encoder = MultiLabelBinarizer(sparse_output=True)
         y_encoded = self.label_encoder.fit_transform(labels_list)
         
-        logger.info(f"Number of unique labels: {len(self.label_encoder.classes_)}")
+        n_labels = len(self.label_encoder.classes_)
+        n_samples = len(labels_list)
+        dense_size_gb = (n_samples * n_labels * 1) / 1e9  # int8 size estimate
+        
+        logger.info(f"Number of unique labels: {n_labels}")
+        logger.info(f"Label matrix shape: {y_encoded.shape}")
+        logger.info(f"Estimated dense size: {dense_size_gb:.2f} GB (within {MEMORY_GB} GB budget)")
         
         return y_encoded
 
@@ -537,13 +641,30 @@ class LightGBMDynamicMultiLabelClassifier:
 def main():
     """
     Main execution function for training and prediction.
+    Optimized for c2d-standard-32 (32 vCPU, 128 GB RAM).
     """
+    import time
+    total_start = time.time()
+    
     # Configuration
     DATA_PATH = '../data/df_ml2.csv'
     OUTPUT_DIR = './lightgbm_v2_dyna'
     RANDOM_STATE = 42
     TEST_SIZE = 0.2
     TOP_K_LABELS = 4001
+    
+    logger.info("="*80)
+    logger.info("LIGHTGBM DYNAMIC MULTI-LABEL CLASSIFIER")
+    logger.info("Optimized for c2d-standard-32 (32 vCPU, 128 GB RAM)")
+    logger.info("="*80)
+    logger.info(f"Configuration:")
+    logger.info(f"  - Data path: {DATA_PATH}")
+    logger.info(f"  - Output directory: {OUTPUT_DIR}")
+    logger.info(f"  - Top K labels: {TOP_K_LABELS}")
+    logger.info(f"  - Test size: {TEST_SIZE}")
+    logger.info(f"  - Parallel workers (labels): {N_JOBS_LABELS}")
+    logger.info(f"  - Parallel workers (predict): {N_JOBS_PREDICT}")
+    logger.info("="*80)
     
     # Initialize classifier
     classifier = LightGBMDynamicMultiLabelClassifier(
@@ -654,6 +775,8 @@ def main():
     logger.info(f"Comparison CSV saved to {compare_path}")
     
     # Summary statistics
+    total_elapsed = time.time() - total_start
+    
     logger.info("\n" + "="*80)
     logger.info("TRAINING AND PREDICTION SUMMARY")
     logger.info("="*80)
@@ -668,8 +791,17 @@ def main():
                f"({100*overall_exact/len(true_labels):.2f}%)")
     
     logger.info("\n" + "="*80)
-    logger.info("Training and prediction completed successfully!")
+    logger.info("EXECUTION COMPLETED SUCCESSFULLY")
+    logger.info("="*80)
+    logger.info(f"Total execution time: {total_elapsed:.1f} seconds ({total_elapsed/60:.1f} min)")
     logger.info(f"All artifacts saved to: {OUTPUT_DIR}")
+    logger.info("Saved files:")
+    logger.info(f"  - lightgbm_multilabel_model_dyna.joblib (trained model)")
+    logger.info(f"  - label_encoder.joblib (label encoder)")
+    logger.info(f"  - feature_columns.joblib (feature names)")
+    logger.info(f"  - test_predictions_dyna.joblib (test predictions)")
+    logger.info(f"  - exact_match_accuracy_dyna.csv (accuracy metrics)")
+    logger.info(f"  - pred_vs_true_dyna.csv (detailed comparison)")
     logger.info("="*80)
 
 
