@@ -10,15 +10,20 @@ labels dynamically based on true label cardinality:
 Evaluation uses exact match accuracy per cardinality bucket.
 
 Optimized for: c2d-standard-32 (32 vCPU, 128 GB RAM)
+Designed to run with: nohup python train_predict_lightgbm_dyna.py > output.log 2>&1 &
 
 Author: ML Engineering Team
 Date: December 2025
 """
 
 import os
+import sys
 import ast
 import logging
+import signal
+import traceback
 from collections import Counter
+from datetime import datetime
 import warnings
 import pandas as pd
 import numpy as np
@@ -32,12 +37,29 @@ from joblib import Parallel, delayed
 
 warnings.filterwarnings('ignore')
 
-# Configure logging
+# ============================================================================
+# NOHUP COMPATIBILITY: Force unbuffered output
+# ============================================================================
+# This ensures output is immediately written to nohup.out
+class FlushingStreamHandler(logging.StreamHandler):
+    """StreamHandler that flushes after each emit for nohup compatibility."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+# Configure logging with immediate flushing for nohup
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[FlushingStreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+# Force unbuffered stdout/stderr for nohup
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(line_buffering=True)
 
 # ============================================================================
 # MACHINE CONFIGURATION: c2d-standard-32 (32 vCPU, 128 GB RAM)
@@ -50,6 +72,33 @@ N_JOBS_LABELS = N_CPUS  # Number of labels to train in parallel
 N_JOBS_LGB = 1          # Threads per LightGBM estimator
 # For prediction: use all cores for parallel probability computation
 N_JOBS_PREDICT = N_CPUS
+
+# ============================================================================
+# SIGNAL HANDLING FOR GRACEFUL SHUTDOWN (nohup compatibility)
+# ============================================================================
+SHUTDOWN_REQUESTED = False
+
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    global SHUTDOWN_REQUESTED
+    sig_name = signal.Signals(signum).name
+    logger.warning(f"Received signal {sig_name} ({signum}). Requesting graceful shutdown...")
+    SHUTDOWN_REQUESTED = True
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, signal_handler)  # kill command
+signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+try:
+    signal.signal(signal.SIGHUP, signal_handler)   # terminal hangup (nohup)
+except (AttributeError, ValueError):
+    pass  # SIGHUP not available on Windows
+
+
+def check_shutdown():
+    """Check if shutdown was requested and exit gracefully if so."""
+    if SHUTDOWN_REQUESTED:
+        logger.warning("Shutdown requested. Saving checkpoint and exiting...")
+        raise SystemExit("Graceful shutdown requested")
 
 
 class LightGBMDynamicMultiLabelClassifier:
@@ -638,10 +687,29 @@ class LightGBMDynamicMultiLabelClassifier:
         logger.info(f"Feature columns loaded from {features_path}")
 
 
+def write_status(output_dir, status, message=""):
+    """Write current status to a file for monitoring progress."""
+    status_path = os.path.join(output_dir, 'training_status.txt')
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(status_path, 'w') as f:
+        f.write(f"Status: {status}\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Message: {message}\n")
+    sys.stdout.flush()
+
+
 def main():
     """
     Main execution function for training and prediction.
     Optimized for c2d-standard-32 (32 vCPU, 128 GB RAM).
+    Designed to run with nohup for long-running background execution.
+    
+    Usage:
+        nohup python train_predict_lightgbm_dyna.py > training.log 2>&1 &
+        
+        # Monitor progress:
+        tail -f training.log
+        cat lightgbm_v2_dyna/training_status.txt
     """
     import time
     total_start = time.time()
@@ -653,156 +721,226 @@ def main():
     TEST_SIZE = 0.2
     TOP_K_LABELS = 4001
     
-    logger.info("="*80)
-    logger.info("LIGHTGBM DYNAMIC MULTI-LABEL CLASSIFIER")
-    logger.info("Optimized for c2d-standard-32 (32 vCPU, 128 GB RAM)")
-    logger.info("="*80)
-    logger.info(f"Configuration:")
-    logger.info(f"  - Data path: {DATA_PATH}")
-    logger.info(f"  - Output directory: {OUTPUT_DIR}")
-    logger.info(f"  - Top K labels: {TOP_K_LABELS}")
-    logger.info(f"  - Test size: {TEST_SIZE}")
-    logger.info(f"  - Parallel workers (labels): {N_JOBS_LABELS}")
-    logger.info(f"  - Parallel workers (predict): {N_JOBS_PREDICT}")
-    logger.info("="*80)
-    
-    # Initialize classifier
-    classifier = LightGBMDynamicMultiLabelClassifier(
-        random_state=RANDOM_STATE,
-        test_size=TEST_SIZE
-    )
-    
-    # Load and prepare data
-    df = classifier.load_and_prepare_data(DATA_PATH)
-    
-    # Parse labels
-    labels_list = classifier.parse_labels(df)
-
-    # Keep only the top K frequent labels
-    top_labels = classifier.get_top_labels(labels_list, top_k=TOP_K_LABELS)
-    filtered_labels, kept_indices = classifier.filter_labels_to_top(
-        labels_list, top_labels, k=3
-    )
-
-    # Filter dataframe to kept rows
-    df_filtered = df.iloc[kept_indices].reset_index(drop=True)
-    logger.info(f"Data filtered to {df_filtered.shape[0]} rows after top-label selection")
-    
-    # Prepare features
-    X = classifier.prepare_features(df_filtered)
-    
-    # Encode labels to one-hot format
-    y_encoded = classifier.fit_label_encoder(filtered_labels)
-    
-    # Split data
-    X_train, X_test, y_train, y_test = classifier.split_data(X, y_encoded)
-    
-    # Build and train model
-    classifier.build_model()
-    classifier.train(X_train, y_train)
-    
-    # Decode true labels for test set
-    true_labels = classifier.decode_true_labels(y_test)
-    
-    # Make dynamic predictions based on true label cardinality
-    y_pred_labels_dyna, y_pred_probas_dyna = classifier.predict_dynamic_with_probabilities(
-        X_test, true_labels
-    )
-    
-    # Also get standard top-3 predictions for comparison
-    y_pred_labels_top3, y_pred_probas_top3 = classifier.predict_top_k_with_probabilities(X_test, k=3)
-    
-    # Display sample predictions
-    logger.info("\n" + "="*80)
-    logger.info("SAMPLE PREDICTIONS (First 10 test samples)")
-    logger.info("="*80)
-    for i in range(min(10, len(y_pred_labels_dyna))):
-        logger.info(f"\nSample {i+1}:")
-        logger.info(f"  True Labels ({len(true_labels[i])}): {true_labels[i]}")
-        logger.info(f"  Dynamic Pred ({len(y_pred_labels_dyna[i])}): {y_pred_labels_dyna[i]}")
-        logger.info(f"  Probabilities: {[f'{p:.4f}' for p in y_pred_probas_dyna[i]]}")
-        match = "✓ EXACT" if set(true_labels[i]) == set(y_pred_labels_dyna[i]) else "✗ WRONG"
-        logger.info(f"  Match: {match}")
-    
-    # Create output directory
+    # Create output directory early for status file
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Save model
-    classifier.save_model(OUTPUT_DIR)
+    try:
+        logger.info("="*80)
+        logger.info("LIGHTGBM DYNAMIC MULTI-LABEL CLASSIFIER")
+        logger.info("Optimized for c2d-standard-32 (32 vCPU, 128 GB RAM)")
+        logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"PID: {os.getpid()}")
+        logger.info("="*80)
+        logger.info(f"Configuration:")
+        logger.info(f"  - Data path: {DATA_PATH}")
+        logger.info(f"  - Output directory: {OUTPUT_DIR}")
+        logger.info(f"  - Top K labels: {TOP_K_LABELS}")
+        logger.info(f"  - Test size: {TEST_SIZE}")
+        logger.info(f"  - Parallel workers (labels): {N_JOBS_LABELS}")
+        logger.info(f"  - Parallel workers (predict): {N_JOBS_PREDICT}")
+        logger.info("="*80)
+        sys.stdout.flush()
+        
+        write_status(OUTPUT_DIR, "STARTING", "Initializing classifier")
+        
+        # Initialize classifier
+        classifier = LightGBMDynamicMultiLabelClassifier(
+            random_state=RANDOM_STATE,
+            test_size=TEST_SIZE
+        )
+        
+        # Check for shutdown request
+        check_shutdown()
+        
+        # Load and prepare data
+        write_status(OUTPUT_DIR, "LOADING_DATA", f"Loading from {DATA_PATH}")
+        df = classifier.load_and_prepare_data(DATA_PATH)
     
-    # Save train/test split data
-    split_data = {
-        'X_test': X_test,
-        'y_test': y_test,
-        'true_labels': true_labels,
-        'y_pred_labels_dyna': y_pred_labels_dyna,
-        'y_pred_probas_dyna': y_pred_probas_dyna,
-        'y_pred_labels_top3': y_pred_labels_top3,
-        'y_pred_probas_top3': y_pred_probas_top3,
-    }
-    split_path = os.path.join(OUTPUT_DIR, 'test_predictions_dyna.joblib')
-    joblib.dump(split_data, split_path)
-    logger.info(f"\nTest predictions saved to {split_path}")
+        # Parse labels
+        write_status(OUTPUT_DIR, "PARSING_LABELS", "Parsing label column")
+        labels_list = classifier.parse_labels(df)
+        check_shutdown()
 
-    # Evaluate exact match by cardinality (dynamic predictions)
-    metrics_path = os.path.join(OUTPUT_DIR, 'exact_match_accuracy_dyna.csv')
-    classifier.evaluate_exact_match_by_cardinality(true_labels, y_pred_labels_dyna, metrics_path)
+        # Keep only the top K frequent labels
+        write_status(OUTPUT_DIR, "FILTERING_LABELS", f"Filtering to top {TOP_K_LABELS} labels")
+        top_labels = classifier.get_top_labels(labels_list, top_k=TOP_K_LABELS)
+        filtered_labels, kept_indices = classifier.filter_labels_to_top(
+            labels_list, top_labels, k=3
+        )
+        check_shutdown()
 
-    # Export compact comparison CSV
-    clot_candidates = ['Clot_1er_Pa', 'Clot1erPas', 'Clot1erPa', 'Clot_1er_Pas']
-    clot_col = next((c for c in clot_candidates if c in X_test.columns), None)
-    if not clot_col:
-        raise KeyError(f"None of the Clot columns found in X_test. Candidates: {clot_candidates}")
+        # Filter dataframe to kept rows
+        df_filtered = df.iloc[kept_indices].reset_index(drop=True)
+        logger.info(f"Data filtered to {df_filtered.shape[0]} rows after top-label selection")
+        sys.stdout.flush()
+        
+        # Prepare features
+        write_status(OUTPUT_DIR, "PREPARING_FEATURES", f"Processing {df_filtered.shape[0]} rows")
+        X = classifier.prepare_features(df_filtered)
+        check_shutdown()
+        
+        # Encode labels to one-hot format
+        write_status(OUTPUT_DIR, "ENCODING_LABELS", "Creating one-hot encoding")
+        y_encoded = classifier.fit_label_encoder(filtered_labels)
+        check_shutdown()
+        
+        # Split data
+        write_status(OUTPUT_DIR, "SPLITTING_DATA", f"Test size: {TEST_SIZE}")
+        X_train, X_test, y_train, y_test = classifier.split_data(X, y_encoded)
+        check_shutdown()
+        
+        # Build and train model
+        write_status(OUTPUT_DIR, "TRAINING", f"Training on {X_train.shape[0]} samples with {N_JOBS_LABELS} workers")
+        classifier.build_model()
+        classifier.train(X_train, y_train)
+        check_shutdown()
+        
+        # Save model immediately after training (checkpoint)
+        write_status(OUTPUT_DIR, "SAVING_MODEL", "Saving trained model checkpoint")
+        classifier.save_model(OUTPUT_DIR)
+        logger.info("Model checkpoint saved successfully")
+        sys.stdout.flush()
+    
+        # Decode true labels for test set
+        write_status(OUTPUT_DIR, "PREDICTING", f"Running predictions on {X_test.shape[0]} test samples")
+        true_labels = classifier.decode_true_labels(y_test)
+        check_shutdown()
+        
+        # Make dynamic predictions based on true label cardinality
+        y_pred_labels_dyna, y_pred_probas_dyna = classifier.predict_dynamic_with_probabilities(
+            X_test, true_labels
+        )
+        check_shutdown()
+        
+        # Also get standard top-3 predictions for comparison
+        y_pred_labels_top3, y_pred_probas_top3 = classifier.predict_top_k_with_probabilities(X_test, k=3)
+        check_shutdown()
+        
+        # Display sample predictions
+        logger.info("\n" + "="*80)
+        logger.info("SAMPLE PREDICTIONS (First 10 test samples)")
+        logger.info("="*80)
+        for i in range(min(10, len(y_pred_labels_dyna))):
+            logger.info(f"\nSample {i+1}:")
+            logger.info(f"  True Labels ({len(true_labels[i])}): {true_labels[i]}")
+            logger.info(f"  Dynamic Pred ({len(y_pred_labels_dyna[i])}): {y_pred_labels_dyna[i]}")
+            logger.info(f"  Probabilities: {[f'{p:.4f}' for p in y_pred_probas_dyna[i]]}")
+            match = "EXACT MATCH" if set(true_labels[i]) == set(y_pred_labels_dyna[i]) else "WRONG"
+            logger.info(f"  Match: {match}")
+        sys.stdout.flush()
+        
+        # Save train/test split data
+        write_status(OUTPUT_DIR, "SAVING_PREDICTIONS", "Saving test predictions")
+        split_data = {
+            'X_test': X_test,
+            'y_test': y_test,
+            'true_labels': true_labels,
+            'y_pred_labels_dyna': y_pred_labels_dyna,
+            'y_pred_probas_dyna': y_pred_probas_dyna,
+            'y_pred_labels_top3': y_pred_labels_top3,
+            'y_pred_probas_top3': y_pred_probas_top3,
+        }
+        split_path = os.path.join(OUTPUT_DIR, 'test_predictions_dyna.joblib')
+        joblib.dump(split_data, split_path)
+        logger.info(f"\nTest predictions saved to {split_path}")
+        sys.stdout.flush()
 
-    type_col = 'Type_Prediag'
-    if type_col not in X_test.columns:
-        raise KeyError("Column 'Type_Prediag' not found in X_test.")
+        # Evaluate exact match by cardinality (dynamic predictions)
+        write_status(OUTPUT_DIR, "EVALUATING", "Computing accuracy metrics")
+        metrics_path = os.path.join(OUTPUT_DIR, 'exact_match_accuracy_dyna.csv')
+        classifier.evaluate_exact_match_by_cardinality(true_labels, y_pred_labels_dyna, metrics_path)
 
-    comp_df = pd.DataFrame({
-        'Sample_ID': range(len(X_test)),
-        'True_Labels_List': [str(lst) for lst in true_labels],
-        'True_Cardinality': [len(lst) for lst in true_labels],
-        'Predicted_Labels_Dyna': [str(lst) for lst in y_pred_labels_dyna],
-        'Pred_Cardinality': [len(lst) for lst in y_pred_labels_dyna],
-        'Predicted_Probas_Dyna': [str([round(p, 4) for p in lst]) for lst in y_pred_probas_dyna],
-        'Exact_Match': [set(t) == set(p) for t, p in zip(true_labels, y_pred_labels_dyna)],
-        'QteConso': X_test['QteConso'].values,
-        'Clot_1er_Pa': X_test[clot_col].values,
-        'Type_Prediag': X_test[type_col].values,
-    })
-    compare_path = os.path.join(OUTPUT_DIR, 'pred_vs_true_dyna.csv')
-    comp_df.to_csv(compare_path, index=False)
-    logger.info(f"Comparison CSV saved to {compare_path}")
-    
-    # Summary statistics
-    total_elapsed = time.time() - total_start
-    
-    logger.info("\n" + "="*80)
-    logger.info("TRAINING AND PREDICTION SUMMARY")
-    logger.info("="*80)
-    logger.info(f"Total test samples: {len(X_test)}")
-    logger.info(f"Cardinality distribution:")
-    for card in [1, 2, 3]:
-        count = sum(1 for t in true_labels if len(t) == card)
-        logger.info(f"  {card} label(s): {count} samples ({100*count/len(true_labels):.1f}%)")
-    
-    overall_exact = sum(1 for t, p in zip(true_labels, y_pred_labels_dyna) if set(t) == set(p))
-    logger.info(f"\nOverall Exact Match Accuracy: {overall_exact}/{len(true_labels)} "
-               f"({100*overall_exact/len(true_labels):.2f}%)")
-    
-    logger.info("\n" + "="*80)
-    logger.info("EXECUTION COMPLETED SUCCESSFULLY")
-    logger.info("="*80)
-    logger.info(f"Total execution time: {total_elapsed:.1f} seconds ({total_elapsed/60:.1f} min)")
-    logger.info(f"All artifacts saved to: {OUTPUT_DIR}")
-    logger.info("Saved files:")
-    logger.info(f"  - lightgbm_multilabel_model_dyna.joblib (trained model)")
-    logger.info(f"  - label_encoder.joblib (label encoder)")
-    logger.info(f"  - feature_columns.joblib (feature names)")
-    logger.info(f"  - test_predictions_dyna.joblib (test predictions)")
-    logger.info(f"  - exact_match_accuracy_dyna.csv (accuracy metrics)")
-    logger.info(f"  - pred_vs_true_dyna.csv (detailed comparison)")
-    logger.info("="*80)
+        # Export compact comparison CSV
+        write_status(OUTPUT_DIR, "EXPORTING", "Creating comparison CSV")
+        clot_candidates = ['Clot_1er_Pa', 'Clot1erPas', 'Clot1erPa', 'Clot_1er_Pas']
+        clot_col = next((c for c in clot_candidates if c in X_test.columns), None)
+        if not clot_col:
+            raise KeyError(f"None of the Clot columns found in X_test. Candidates: {clot_candidates}")
+
+        type_col = 'Type_Prediag'
+        if type_col not in X_test.columns:
+            raise KeyError("Column 'Type_Prediag' not found in X_test.")
+
+        comp_df = pd.DataFrame({
+            'Sample_ID': range(len(X_test)),
+            'True_Labels_List': [str(lst) for lst in true_labels],
+            'True_Cardinality': [len(lst) for lst in true_labels],
+            'Predicted_Labels_Dyna': [str(lst) for lst in y_pred_labels_dyna],
+            'Pred_Cardinality': [len(lst) for lst in y_pred_labels_dyna],
+            'Predicted_Probas_Dyna': [str([round(p, 4) for p in lst]) for lst in y_pred_probas_dyna],
+            'Exact_Match': [set(t) == set(p) for t, p in zip(true_labels, y_pred_labels_dyna)],
+            'QteConso': X_test['QteConso'].values,
+            'Clot_1er_Pa': X_test[clot_col].values,
+            'Type_Prediag': X_test[type_col].values,
+        })
+        compare_path = os.path.join(OUTPUT_DIR, 'pred_vs_true_dyna.csv')
+        comp_df.to_csv(compare_path, index=False)
+        logger.info(f"Comparison CSV saved to {compare_path}")
+        
+        # Summary statistics
+        total_elapsed = time.time() - total_start
+        
+        logger.info("\n" + "="*80)
+        logger.info("TRAINING AND PREDICTION SUMMARY")
+        logger.info("="*80)
+        logger.info(f"Total test samples: {len(X_test)}")
+        logger.info(f"Cardinality distribution:")
+        for card in [1, 2, 3]:
+            count = sum(1 for t in true_labels if len(t) == card)
+            logger.info(f"  {card} label(s): {count} samples ({100*count/len(true_labels):.1f}%)")
+        
+        overall_exact = sum(1 for t, p in zip(true_labels, y_pred_labels_dyna) if set(t) == set(p))
+        logger.info(f"\nOverall Exact Match Accuracy: {overall_exact}/{len(true_labels)} "
+                   f"({100*overall_exact/len(true_labels):.2f}%)")
+        
+        logger.info("\n" + "="*80)
+        logger.info("EXECUTION COMPLETED SUCCESSFULLY")
+        logger.info("="*80)
+        logger.info(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Total execution time: {total_elapsed:.1f} seconds ({total_elapsed/60:.1f} min)")
+        logger.info(f"All artifacts saved to: {OUTPUT_DIR}")
+        logger.info("Saved files:")
+        logger.info(f"  - lightgbm_multilabel_model_dyna.joblib (trained model)")
+        logger.info(f"  - label_encoder.joblib (label encoder)")
+        logger.info(f"  - feature_columns.joblib (feature names)")
+        logger.info(f"  - test_predictions_dyna.joblib (test predictions)")
+        logger.info(f"  - exact_match_accuracy_dyna.csv (accuracy metrics)")
+        logger.info(f"  - pred_vs_true_dyna.csv (detailed comparison)")
+        logger.info(f"  - training_status.txt (status file)")
+        logger.info("="*80)
+        sys.stdout.flush()
+        
+        # Write final success status
+        write_status(OUTPUT_DIR, "COMPLETED", 
+                    f"Successfully completed in {total_elapsed:.1f}s. "
+                    f"Accuracy: {100*overall_exact/len(true_labels):.2f}%")
+        
+    except KeyboardInterrupt:
+        logger.warning("\n" + "="*80)
+        logger.warning("INTERRUPTED BY USER (Ctrl+C or kill signal)")
+        logger.warning("="*80)
+        write_status(OUTPUT_DIR, "INTERRUPTED", "User interrupted execution")
+        sys.exit(130)
+        
+    except SystemExit as e:
+        logger.warning(f"System exit: {e}")
+        write_status(OUTPUT_DIR, "INTERRUPTED", str(e))
+        sys.exit(1)
+        
+    except Exception as e:
+        logger.error("\n" + "="*80)
+        logger.error("EXECUTION FAILED WITH ERROR")
+        logger.error("="*80)
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.error("\nFull traceback:")
+        logger.error(traceback.format_exc())
+        logger.error("="*80)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        write_status(OUTPUT_DIR, "FAILED", f"{type(e).__name__}: {str(e)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
